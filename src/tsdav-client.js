@@ -1,4 +1,5 @@
-import { DAVClient } from 'tsdav';
+import { DAVClient, getOauthHeaders } from 'tsdav';
+import { createDavFetch, createTokenFetch } from './dav-fetch.js';
 import { logger } from './logger.js';
 import { CalDAVError, CardDAVError } from './error-handler.js';
 
@@ -38,6 +39,7 @@ class TsdavClientManager {
   async initialize(config) {
     this.config = config;
     this.authMethod = config.authMethod || 'Basic';
+    this.davFetch = createDavFetch(config.serverUrl);
 
     try {
       // Determine authentication method
@@ -84,6 +86,7 @@ class TsdavClientManager {
       },
       authMethod: 'Basic',
       defaultAccountType: 'caldav',
+      fetch: this.davFetch,
     });
 
     // CardDAV Client
@@ -95,6 +98,7 @@ class TsdavClientManager {
       },
       authMethod: 'Basic',
       defaultAccountType: 'carddav',
+      fetch: this.davFetch,
     });
 
     // Login to both clients
@@ -120,6 +124,11 @@ class TsdavClientManager {
 
     // Default to Google's token endpoint if not specified
     const tokenUrl = config.tokenUrl || 'https://accounts.google.com/o/oauth2/token';
+    const tokenFetch = createTokenFetch(tokenUrl);
+    // Keep token exchange separate from the DAV transport. A DAV request to
+    // the token origin must not gain an exception to the DAV origin policy.
+    const authFunction = async (credentials) =>
+      (await getOauthHeaders(credentials, {}, tokenFetch)).headers;
 
     const oauthCredentials = {
       tokenUrl,
@@ -139,8 +148,10 @@ class TsdavClientManager {
     this.calDavClient = new DAVClient({
       serverUrl: config.serverUrl,
       credentials: oauthCredentials,
-      authMethod: 'Oauth', // Note: tsdav expects 'Oauth' with capital O
+      authMethod: 'Custom',
+      authFunction,
       defaultAccountType: 'caldav',
+      fetch: this.davFetch,
     });
 
     // CardDAV Client with OAuth
@@ -149,8 +160,10 @@ class TsdavClientManager {
     this.cardDavClient = new DAVClient({
       serverUrl: config.serverUrl,
       credentials: oauthCredentials,
-      authMethod: 'Oauth',
+      authMethod: 'Custom',
+      authFunction,
       defaultAccountType: 'carddav',
+      fetch: this.davFetch,
     });
 
     // Login to CalDAV client

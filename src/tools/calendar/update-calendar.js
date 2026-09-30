@@ -65,8 +65,8 @@ export const updateCalendar = {
     proppatchXml += '  </d:set>\n';
     proppatchXml += '</d:propertyupdate>';
 
-    // Use raw fetch with HTTP PROPPATCH method
-    const response = await fetch(validated.calendar_url, {
+    // Use the same restricted transport as discovery and other DAV operations.
+    const response = await tsdavManager.davFetch(validated.calendar_url, {
       method: 'PROPPATCH',
       headers: {
         'Content-Type': 'text/xml; charset=utf-8',
