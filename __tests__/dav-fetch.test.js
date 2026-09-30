@@ -23,23 +23,37 @@ beforeAll(async () => {
   foreign = createServer(async (req, res) => {
     let body = '';
     for await (const chunk of req) body += chunk;
-    foreignRequests.push({ url: req.url, headers: req.headers, body });
-    res.setHeader('Content-Type', 'application/json');
+    foreignRequests.push({ url: req.url, method: req.method, headers: req.headers, body });
     if (mode === 'token-redirect') {
       res.writeHead(307, { Location: `${trustedUrl}/stolen-token` });
       res.end();
-    } else res.end(JSON.stringify({ access_token: 'dummy-access-token' }));
+    } else if (mode === 'discovery-redirect') {
+      res.writeHead(207, { 'Content-Type': 'application/xml' });
+      if (req.url === '/dav/') {
+        res.end(xml('/dav/', `<d:current-user-principal><d:href>${foreignUrl}/principal/</d:href></d:current-user-principal>`));
+      } else if (req.url === '/principal/') {
+        res.end(xml('/principal/', `<c:calendar-home-set><d:href>${foreignUrl}/cal/</d:href></c:calendar-home-set><a:addressbook-home-set><d:href>${foreignUrl}/cards/</d:href></a:addressbook-home-set>`));
+      } else {
+        res.end('<d:multistatus xmlns:d="DAV:"/>');
+      }
+    } else {
+      res.setHeader('Content-Type', 'application/json');
+      res.end(JSON.stringify({ access_token: 'dummy-access-token' }));
+    }
   });
   foreignUrl = await listen(foreign);
   trusted = createServer(async (req, res) => {
     let body = '';
     for await (const chunk of req) body += chunk;
     trustedRequests.push({ url: req.url, method: req.method, headers: req.headers, body });
-    if (req.url.startsWith('/redirect/')) {
+    if (req.url.startsWith('/redirect-foreign/')) {
       res.writeHead(Number(req.url.split('/')[2]), { Location: `${foreignUrl}/stolen` });
       res.end();
+    } else if (req.url.startsWith('/redirect-local/')) {
+      res.writeHead(Number(req.url.split('/')[2]), { Location: '/redirect-target' });
+      res.end();
     } else if (req.url.startsWith('/.well-known/')) {
-      res.writeHead(302, { Location: mode === 'discovery-redirect' ? foreignUrl : '/dav/' });
+      res.writeHead(302, { Location: mode === 'discovery-redirect' ? `${foreignUrl}/dav/` : '/dav/' });
       res.end();
     } else if (req.url === '/dav/') {
       res.writeHead(207, { 'Content-Type': 'application/xml' });
@@ -115,12 +129,26 @@ describe('every DAV operation uses the confined transport', () => {
     expect(foreignRequests).toEqual([]);
   });
 
-  test.each([301, 302, 303, 307, 308])('does not follow HTTP %s, even with explicit follow options', async status => {
+  test.each([301, 302, 303, 307, 308])('blocks an HTTP %s redirect to an untrusted origin', async status => {
     await initialize();
     await expect(tsdavManager.getCalDavClient().updateCalendarObject({
-      calendarObject: { url: `${trustedUrl}/redirect/${status}`, etag: '"1"', data: 'private' },
+      calendarObject: { url: `${trustedUrl}/redirect-foreign/${status}`, etag: '"1"', data: 'private' },
       fetchOptions: { redirect: 'follow' },
-    })).rejects.toThrow('redirects are not allowed');
+    })).rejects.toThrow('redirect destination is not trusted');
+    expect(foreignRequests).toEqual([]);
+  });
+
+  test.each([301, 302, 303, 307, 308])('follows an HTTP %s redirect within a trusted origin', async status => {
+    await initialize();
+    trustedRequests = [];
+    await tsdavManager.getCalDavClient().updateCalendarObject({
+      calendarObject: { url: `${trustedUrl}/redirect-local/${status}`, etag: '"1"', data: 'private' },
+      fetchOptions: { redirect: 'follow' },
+    });
+    expect(trustedRequests.map(r => r.url)).toEqual([
+      `/redirect-local/${status}`,
+      '/redirect-target',
+    ]);
     expect(foreignRequests).toEqual([]);
   });
 });
@@ -132,11 +160,21 @@ describe('discovery and returned URLs', () => {
     expect(tsdavManager.getCardDavClient().account.homeUrl).toBe(`${trustedUrl}/cards/`);
     expect(trustedRequests.some(r => r.url === '/.well-known/caldav')).toBe(true);
   });
-  test('a hostile discovery redirect is never followed', async () => {
+  test('a cross-origin well-known redirect establishes a trusted DAV origin', async () => {
     mode = 'discovery-redirect';
-    // tsdav falls back to the configured URL after discovery failure.
     await initialize();
-    expect(foreignRequests).toEqual([]);
+    expect(tsdavManager.getCalDavClient().account.homeUrl).toBe(`${foreignUrl}/cal/`);
+    expect(tsdavManager.getCardDavClient().account.homeUrl).toBe(`${foreignUrl}/cards/`);
+    expect(foreignRequests.some(r => r.url === '/dav/')).toBe(true);
+
+    foreignRequests = [];
+    await tsdavManager.getCalDavClient().updateCalendarObject({
+      calendarObject: { url: `${foreignUrl}/cal/event.ics`, etag: '"1"', data: 'private' },
+    });
+    expect(foreignRequests).toHaveLength(1);
+    expect(foreignRequests[0].headers.authorization).toBe(
+      `Basic ${Buffer.from('test-user:test-password').toString('base64')}`
+    );
   });
   test('a hostile principal is blocked during login', async () => {
     mode = 'principal';
@@ -176,7 +214,7 @@ describe('OAuth endpoints are separate from DAV origins', () => {
   });
   test('token redirects do not forward the client secret or refresh token', async () => {
     mode = 'token-redirect';
-    await expect(initialize(oauth())).rejects.toThrow('redirects are not allowed');
+    await expect(initialize(oauth())).rejects.toThrow('redirect destination is not trusted');
     expect(trustedRequests).toEqual([]);
   });
   test('token policy rejects a different path on the configured origin', async () => {
@@ -209,6 +247,19 @@ describe('URL parsing', () => {
     const spy = jest.spyOn(globalThis, 'fetch').mockResolvedValue(new Response(null, { status: 204 }));
     try {
       await createDavFetch('https://DAV.EXAMPLE.COM:443/dav/')('https://dav.example.com/cal/');
+      expect(spy).toHaveBeenCalledTimes(1);
+    } finally { spy.mockRestore(); }
+  });
+  test('HTTPS discovery cannot downgrade to HTTP', async () => {
+    const spy = jest.spyOn(globalThis, 'fetch').mockResolvedValue(new Response(null, {
+      status: 302,
+      headers: { Location: 'http://dav-provider.example.com/' },
+    }));
+    try {
+      await expect(createDavFetch('https://dav.example.com/')(
+        'https://dav.example.com/.well-known/caldav',
+        { method: 'PROPFIND', redirect: 'manual' },
+      )).rejects.toThrow('cannot downgrade to HTTP');
       expect(spy).toHaveBeenCalledTimes(1);
     } finally { spy.mockRestore(); }
   });

@@ -12,34 +12,82 @@ function parseHttpUrl(value) {
   return url;
 }
 
-function restrictedFetch(configuredUrl, exact) {
-  const allowed = parseHttpUrl(configuredUrl);
-  // Capture the trusted configuration, not a caller-controlled client property.
-  const allowedDestination = exact ? allowed.href : allowed.origin;
+function restrictedFetch(configuredUrl, { exact = false, allowDavDiscovery = false } = {}) {
+  const configured = parseHttpUrl(configuredUrl);
+  const trustedOrigins = new Set([configured.origin]);
+  const exactEndpoint = configured.href;
+
+  const isAllowed = (url) => exact ? url.href === exactEndpoint : trustedOrigins.has(url.origin);
 
   return async (input, init = {}) => {
-    const target = parseHttpUrl(input instanceof Request ? input.url : input);
-    if ((exact ? target.href : target.origin) !== allowedDestination) {
-      throw new Error('DAV URL is not allowed: destination does not match configured endpoint');
-    }
+    let currentInput = input;
+    let current = parseHttpUrl(input instanceof Request ? input.url : input);
+    let currentInit = { ...init };
+    const redirectMode = init.redirect || (input instanceof Request ? input.redirect : 'follow');
 
-    // Force manual handling even if the caller or dependency requests follow.
-    // Reject all redirects; never forward credentials or bodies to Location.
-    const response = await fetch(input, { ...init, redirect: 'manual' });
-    if (response.status >= 300 && response.status < 400) {
+    for (let redirects = 0; ; redirects += 1) {
+      if (!isAllowed(current)) {
+        throw new Error('DAV URL is not allowed: destination does not match a trusted endpoint');
+      }
+
+      const response = await fetch(currentInput, { ...currentInit, redirect: 'manual' });
+      if (response.status < 300 || response.status >= 400) return response;
+
+      const location = response.headers.get('location');
+      if (!location) return response;
+
+      const next = parseHttpUrl(new URL(location, current));
+      const method = (currentInit.method || (currentInput instanceof Request ? currentInput.method : 'GET')).toUpperCase();
+      const isWellKnownDiscovery = allowDavDiscovery &&
+        redirectMode === 'manual' &&
+        method === 'PROPFIND' &&
+        current.origin === configured.origin &&
+        ['/.well-known/caldav', '/.well-known/carddav'].includes(current.pathname);
+
+      if (isWellKnownDiscovery) {
+        if (configured.protocol === 'https:' && next.protocol !== 'https:') {
+          await response.body?.cancel();
+          throw new Error('DAV URL is not allowed: HTTPS discovery cannot downgrade to HTTP');
+        }
+        // The configured server is allowed to delegate DAV service discovery.
+        // Ordinary redirects and caller-supplied URLs cannot expand this set.
+        trustedOrigins.add(next.origin);
+      } else if (!isAllowed(next)) {
+        await response.body?.cancel();
+        throw new Error('DAV URL is not allowed: redirect destination is not trusted');
+      }
+
+      if (redirectMode === 'error') {
+        await response.body?.cancel();
+        throw new Error('DAV redirect is not allowed by the request policy');
+      }
+      if (redirectMode === 'manual') return response;
+      if (redirects >= 19) {
+        await response.body?.cancel();
+        throw new Error('DAV redirect limit exceeded');
+      }
+
       await response.body?.cancel();
-      throw new Error('DAV redirects are not allowed; configure the final endpoint URL');
+      currentInput = next.href;
+      current = next;
+
+      // Match Fetch redirect semantics for requests whose method becomes GET.
+      if (response.status === 303 || ([301, 302].includes(response.status) && method === 'POST')) {
+        const headers = new Headers(currentInit.headers || (input instanceof Request ? input.headers : undefined));
+        headers.delete('content-length');
+        headers.delete('content-type');
+        currentInit = { ...currentInit, method: 'GET', body: undefined, headers };
+      }
     }
-    return response;
   };
 }
 
-/** All DAV traffic, including discovery, is confined to this origin. */
+/** DAV traffic is confined to configured or well-known-discovered origins. */
 export function createDavFetch(serverUrl) {
-  return restrictedFetch(serverUrl, false);
+  return restrictedFetch(serverUrl, { allowDavDiscovery: true });
 }
 
 /** OAuth secrets may only be sent to the exact configured token endpoint. */
 export function createTokenFetch(tokenUrl) {
-  return restrictedFetch(tokenUrl, true);
+  return restrictedFetch(tokenUrl, { exact: true });
 }
